@@ -4,3 +4,7 @@
 FROM evoapicloud/evolution-api:v2.3.7
 
 COPY prebuilt /evolution/dist
+
+# TEMPORARIO (diagnostico): instrumenta o productCreate do Baileys para expor o JSON cru.
+COPY tools/patch-baileys-catalog.js /tmp/patch-baileys-catalog.js
+RUN node /tmp/patch-baileys-catalog.js
