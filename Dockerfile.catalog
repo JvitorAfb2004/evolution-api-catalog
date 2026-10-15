@@ -1,0 +1,6 @@
+# Overlay do dist já compilado sobre a imagem oficial.
+# Motivo: compilar (npm ci + tsup) dentro da VPS estourava RAM e derrubava o servidor.
+# Fonte do codigo: https://github.com/JvitorAfb2004/evolution-api-catalog
+FROM evoapicloud/evolution-api:v2.3.7
+
+COPY prebuilt /evolution/dist
