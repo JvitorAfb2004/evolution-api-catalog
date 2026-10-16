@@ -5225,7 +5225,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async deleteProduct(data: deleteProductDto): Promise<{ deletedCount: number }> {
-    const variables = { input: { product: { biz_jid: this.catalogOwnerJid(), product_ids: data.productIds } } };
+    // Diferente de add/edit, o input do delete é plano: { biz_jid, product_ids }
+    // (WAWebBizCatalogDeleteProductsJob -> deleteProduct({ biz_jid, product_ids })).
+    const variables = { input: { biz_jid: this.catalogOwnerJid(), product_ids: data.productIds } };
     const result = await this.catalogMutation<{ xfb_whatsapp_catalog_delete_product?: { deleted_count?: number } }>(
       BaileysStartupService.CATALOG_DELETE_DOC,
       variables,
