@@ -5096,12 +5096,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
   // O catálogo é endereçado pelo JID dono: LID quando a conta usa LID, senão o PN (sem device).
   private catalogOwnerJid(): string {
-    const me = this.client?.user;
-    if (!me) {
+    const me = this.client?.authState?.creds?.me;
+    const jid = me?.lid || me?.id || this.client?.user?.lid || this.client?.user?.id || this.instance?.wuid;
+
+    if (!jid) {
       throw new InternalServerErrorException('Error catalog owner', 'instância sem usuário conectado');
     }
 
-    return jidNormalizedUser(me.lid || me.id);
+    return jidNormalizedUser(jid);
   }
 
   private async catalogMutation<T>(docId: string, variables: unknown, allowRetry = true): Promise<T> {
