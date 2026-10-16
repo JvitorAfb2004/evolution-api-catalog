@@ -96,7 +96,6 @@ import makeWASocket, {
   BufferedEventData,
   BufferJSON,
   CacheStore,
-  CatalogCollection,
   Chat,
   ConnectionState,
   Contact,
@@ -122,7 +121,6 @@ import makeWASocket, {
   MiscMessageGenerationOptions,
   ParticipantAction,
   prepareWAMessageMedia,
-  Product,
   proto,
   UserFacingSocketConfig,
   WABrowserDescription,
@@ -4909,9 +4907,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
   //Business Controller
   public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
-    const jid = data.number ? createJid(data.number) : this.client?.user?.id;
+    const jid = data.number ? createJid(data.number) : this.catalogOwnerJid();
     const limit = data.limit || 10;
-    const cursor = null;
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
 
@@ -4923,26 +4920,21 @@ export class BaileysStartupService extends ChannelStartupService {
       const info = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
       const business = await this.fetchBusinessProfile(info?.jid);
 
-      let catalog = await this.getCatalog({ jid: info?.jid, limit, cursor });
-      let nextPageCursor = catalog.nextPageCursor;
-      let nextPageCursorJson = nextPageCursor ? JSON.parse(atob(nextPageCursor)) : null;
-      let pagination = nextPageCursorJson?.pagination_cursor
-        ? JSON.parse(atob(nextPageCursorJson.pagination_cursor))
-        : null;
-      let fetcherHasMore = pagination?.fetcher_has_more === true ? true : false;
-
+      let catalog = await this.getCatalog({ jid: info?.jid, limit, cursor: undefined });
       let productsCatalog = catalog.products || [];
+      let nextPageCursor = catalog.nextPageCursor;
       let countLoops = 0;
-      while (fetcherHasMore && countLoops < 4) {
+
+      while (nextPageCursor && countLoops < 4) {
+        const previousCursor = nextPageCursor;
         catalog = await this.getCatalog({ jid: info?.jid, limit, cursor: nextPageCursor });
         nextPageCursor = catalog.nextPageCursor;
-        nextPageCursorJson = nextPageCursor ? JSON.parse(atob(nextPageCursor)) : null;
-        pagination = nextPageCursorJson?.pagination_cursor
-          ? JSON.parse(atob(nextPageCursorJson.pagination_cursor))
-          : null;
-        fetcherHasMore = pagination?.fetcher_has_more === true ? true : false;
-        productsCatalog = [...productsCatalog, ...catalog.products];
+        productsCatalog = [...productsCatalog, ...(catalog.products || [])];
         countLoops++;
+
+        if (nextPageCursor === previousCursor) {
+          break;
+        }
       }
 
       return {
@@ -4953,33 +4945,48 @@ export class BaileysStartupService extends ChannelStartupService {
         catalog: productsCatalog,
       };
     } catch (error) {
-      console.log(error);
+      this.logger.error(error);
       return { wuid: jid, name: null, isBusiness: false };
     }
   }
 
+  // Mesmo caminho GraphQL do create/update/delete: o IQ de leitura também não responde mais.
   public async getCatalog({
     jid,
     limit,
     cursor,
-  }: GetCatalogOptions): Promise<{ products: Product[]; nextPageCursor: string | undefined }> {
-    try {
-      jid = jid ? createJid(jid) : this.instance.wuid;
+  }: GetCatalogOptions): Promise<{ products: Record<string, unknown>[]; nextPageCursor: string | undefined }> {
+    const owner = jid ? createJid(jid) : this.catalogOwnerJid();
 
-      const catalog = await this.client.getCatalog({ jid, limit: limit, cursor: cursor });
+    const result = await this.catalogGraphQL<{
+      xfb_whatsapp_catalog?: {
+        product_catalog?: { products?: Record<string, unknown>[]; paging?: { after?: string } };
+      };
+    }>(BaileysStartupService.CATALOG_FETCH_DOC, {
+      request: {
+        product_catalog: {
+          jid: owner,
+          limit: String(limit || 10),
+          width: String(BaileysStartupService.CATALOG_IMAGE_WIDTH),
+          height: String(BaileysStartupService.CATALOG_IMAGE_HEIGHT),
+          belongs_to: {},
+          allow_shop_source: false,
+          variant_info_fields: 'listing_details,types,availability,variant_properties',
+          variant_thumbnail_width: String(BaileysStartupService.CATALOG_IMAGE_WIDTH),
+          variant_thumbnail_height: String(BaileysStartupService.CATALOG_IMAGE_HEIGHT),
+          ...(cursor ? { after: cursor } : {}),
+        },
+        platform: 'WEB',
+      },
+    });
 
-      if (!catalog) {
-        return { products: undefined, nextPageCursor: undefined };
-      }
+    const catalog = result?.xfb_whatsapp_catalog?.product_catalog;
 
-      return catalog;
-    } catch (error) {
-      throw new InternalServerErrorException('Error getCatalog', error.toString());
-    }
+    return { products: catalog?.products || [], nextPageCursor: catalog?.paging?.after || undefined };
   }
 
   public async fetchCollections(instanceName: string, data: getCollectionsDto) {
-    const jid = data.number ? createJid(data.number) : this.client?.user?.id;
+    const jid = data.number ? createJid(data.number) : this.catalogOwnerJid();
     const limit = data.limit <= 20 ? data.limit : 20; //(tem esse limite, não sei porque)
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
@@ -5006,20 +5013,27 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async getCollections(jid?: string | undefined, limit?: number): Promise<CatalogCollection[]> {
-    try {
-      jid = jid ? createJid(jid) : this.instance.wuid;
+  public async getCollections(jid?: string | undefined, limit?: number): Promise<Record<string, unknown>[]> {
+    const owner = jid ? createJid(jid) : this.catalogOwnerJid();
 
-      const result = await this.client.getCollections(jid, limit);
+    const result = await this.catalogGraphQL<{
+      xfb_whatsapp_catalog_collections?: { collections?: Record<string, unknown>[] };
+    }>(BaileysStartupService.CATALOG_COLLECTIONS_DOC, {
+      request: {
+        collections: {
+          biz_jid: owner,
+          after: '',
+          collection_limit: String(limit || 10),
+          item_limit: '3',
+          width: String(BaileysStartupService.CATALOG_IMAGE_WIDTH),
+          height: String(BaileysStartupService.CATALOG_IMAGE_HEIGHT),
+          variant_thumbnail_height: null,
+          variant_thumbnail_width: null,
+        },
+      },
+    });
 
-      if (!result) {
-        return [{ id: undefined, name: undefined, products: [], status: undefined }];
-      }
-
-      return result.collections;
-    } catch (error) {
-      throw new InternalServerErrorException('Error getCatalog', error.toString());
-    }
+    return result?.xfb_whatsapp_catalog_collections?.collections || [];
   }
 
   // --- Catálogo (WhatsApp Business) ---
@@ -5032,6 +5046,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly CATALOG_ADD_DOC = '24249359867999500';
   private static readonly CATALOG_EDIT_DOC = '9889773371084956';
   private static readonly CATALOG_DELETE_DOC = '9376108569185474';
+  private static readonly CATALOG_FETCH_DOC = '9957894520961099';
+  private static readonly CATALOG_COLLECTIONS_DOC = '9687699931342731';
   private static readonly CATALOG_TOKEN_TTL_MS = 20 * 60 * 1000;
   private static readonly CATALOG_IMAGE_WIDTH = 100;
   private static readonly CATALOG_IMAGE_HEIGHT = 100;
@@ -5106,7 +5122,7 @@ export class BaileysStartupService extends ChannelStartupService {
     return jidNormalizedUser(jid);
   }
 
-  private async catalogMutation<T>(docId: string, variables: unknown, allowRetry = true): Promise<T> {
+  private async catalogGraphQL<T>(docId: string, variables: unknown, allowRetry = true): Promise<T> {
     const token = await this.fetchCatalogToken();
 
     const { data } = await axios.post(
@@ -5125,7 +5141,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // 190 = access token expirado/inválido: renova uma vez antes de falhar.
       if (allowRetry && data.errors.some((error: { code?: number }) => error?.code === 190)) {
         this.catalogToken = undefined;
-        return this.catalogMutation<T>(docId, variables, false);
+        return this.catalogGraphQL<T>(docId, variables, false);
       }
 
       throw new InternalServerErrorException('Error catalog mutation', JSON.stringify(data.errors));
@@ -5198,7 +5214,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async createProduct(data: createProductDto): Promise<Record<string, unknown>> {
     const variables = await this.catalogProductVariables(data);
-    const result = await this.catalogMutation<{
+    const result = await this.catalogGraphQL<{
       xfb_whatsapp_catalog_add_product?: { product?: Record<string, unknown> };
     }>(BaileysStartupService.CATALOG_ADD_DOC, variables);
     const product = result?.xfb_whatsapp_catalog_add_product?.product;
@@ -5212,7 +5228,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async updateProduct(data: updateProductDto): Promise<Record<string, unknown>> {
     const variables = await this.catalogProductVariables(data, data.productId);
-    const result = await this.catalogMutation<{
+    const result = await this.catalogGraphQL<{
       xfb_whatsapp_catalog_edit_product?: { product?: Record<string, unknown> };
     }>(BaileysStartupService.CATALOG_EDIT_DOC, variables);
     const product = result?.xfb_whatsapp_catalog_edit_product?.product;
@@ -5228,7 +5244,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // Diferente de add/edit, o input do delete é plano: { biz_jid, product_ids }
     // (WAWebBizCatalogDeleteProductsJob -> deleteProduct({ biz_jid, product_ids })).
     const variables = { input: { biz_jid: this.catalogOwnerJid(), product_ids: data.productIds } };
-    const result = await this.catalogMutation<{ xfb_whatsapp_catalog_delete_product?: { deleted_count?: number } }>(
+    const result = await this.catalogGraphQL<{ xfb_whatsapp_catalog_delete_product?: { deleted_count?: number } }>(
       BaileysStartupService.CATALOG_DELETE_DOC,
       variables,
     );
