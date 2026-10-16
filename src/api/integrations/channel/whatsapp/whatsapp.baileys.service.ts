@@ -697,12 +697,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.client = makeWASocket(socketConfig);
 
-    // Evento injetado por tools/patch-baileys-nonce.js: o push <wa_ad_account_nonce>
-    // é o primeiro passo do access_token de ad-account usado nas mutations de catálogo.
-    (this.client.ev as unknown as { on: (event: string, listener: (payload: { nonce: string }) => void) => void }).on(
-      'business.ctwa-nonce',
-      ({ nonce }) => this.resolveCatalogNonce(nonce),
-    );
+    // The <wa_ad_account_nonce> push (first step of the ad-account access_token used
+    // by catalog mutations) arrives as a child of a notification frame: baileys
+    // dispatches those on the socket as `CB:notification` (see handleNotification in
+    // Socket/messages-recv), the same source the CB:call listener below uses - so the
+    // nonce is captured without patching node_modules.
+    const captureCatalogNonce = (node?: BinaryNode) => {
+      const nonce = BaileysStartupService.findNonceNode(node);
+      const raw = nonce?.content;
+      const value = Buffer.isBuffer(raw) ? raw.toString('utf-8') : typeof raw === 'string' ? raw : '';
+
+      if (value) {
+        this.resolveCatalogNonce(value);
+      }
+    };
+
+    this.client.ws.on('CB:notification', captureCatalogNonce);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -4950,7 +4960,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  // Mesmo caminho GraphQL do create/update/delete: o IQ de leitura também não responde mais.
+  // Same GraphQL path as create/update/delete: the read IQ is not answered anymore.
   public async getCatalog({
     jid,
     limit,
@@ -5036,26 +5046,51 @@ export class BaileysStartupService extends ChannelStartupService {
     return result?.xfb_whatsapp_catalog_collections?.collections || [];
   }
 
-  // --- Catálogo (WhatsApp Business) ---
-  // O IQ w:biz:catalog foi desligado pelo WhatsApp; hoje o Web usa GraphQL em
-  // graph.facebook.com com um access_token de ad-account obtido em dois IQs
-  // (smax 118 -> push <wa_ad_account_nonce> -> smax 104).
-  // Refs: https://github.com/vinikjkkj/wa-diff (WAWebBizCatalogManagement*) e
-  // tools/patch-baileys-nonce.js (emite o evento business.ctwa-nonce).
+  // --- Catalog (WhatsApp Business) ---
+  // WhatsApp no longer answers the w:biz:catalog IQ, so the web client moved to
+  // GraphQL on graph.facebook.com with an ad-account access_token obtained in two
+  // IQs (smax 118 -> <wa_ad_account_nonce> push -> smax 104).
+  // Refs: https://github.com/vinikjkkj/wa-diff (WAWebBizCatalogManagement*).
   private static readonly CATALOG_GRAPHQL_URL = 'https://graph.facebook.com/graphql';
   private static readonly CATALOG_ADD_DOC = '24249359867999500';
   private static readonly CATALOG_EDIT_DOC = '9889773371084956';
   private static readonly CATALOG_DELETE_DOC = '9376108569185474';
   private static readonly CATALOG_FETCH_DOC = '9957894520961099';
   private static readonly CATALOG_COLLECTIONS_DOC = '9687699931342731';
-  private static readonly CATALOG_TOKEN_TTL_MS = 20 * 60 * 1000;
+  // The ad-account token rotates (Meta invalidates it with 190), so keep the
+  // cache short: refreshing is one cheap IQ, a stale token is a failed publish.
+  private static readonly CATALOG_TOKEN_TTL_MS = 5 * 60 * 1000;
   private static readonly CATALOG_IMAGE_WIDTH = 100;
   private static readonly CATALOG_IMAGE_HEIGHT = 100;
 
   private catalogToken?: { value: string; fetchedAt: number };
   private catalogNonceWaiter?: (nonce: string) => void;
 
-  // Chamado pelo listener de 'business.ctwa-nonce' registrado em createClient.
+  /**
+   * Finds the <wa_ad_account_nonce> node at any depth; the push arrives nested in
+   * a notification frame. Used by the socket listener registered in createClient.
+   */
+  private static findNonceNode(node?: BinaryNode): BinaryNode | undefined {
+    if (!node || typeof node !== 'object') {
+      return undefined;
+    }
+
+    if (node.tag === 'wa_ad_account_nonce') {
+      return node;
+    }
+
+    const children = Array.isArray(node.content) ? node.content : [];
+    for (const child of children) {
+      const found = BaileysStartupService.findNonceNode(child as BinaryNode);
+      if (found) {
+        return found;
+      }
+    }
+
+    return undefined;
+  }
+
+  // Called by the socket listener registered in createClient.
   public resolveCatalogNonce(nonce: string): void {
     this.catalogNonceWaiter?.(nonce);
   }
@@ -5110,13 +5145,13 @@ export class BaileysStartupService extends ChannelStartupService {
     return token;
   }
 
-  // O catálogo é endereçado pelo JID dono: LID quando a conta usa LID, senão o PN (sem device).
+  // The catalog is addressed by the owner JID: LID when the account uses LID, PN otherwise (no device).
   private catalogOwnerJid(): string {
     const me = this.client?.authState?.creds?.me;
     const jid = me?.lid || me?.id || this.client?.user?.lid || this.client?.user?.id || this.instance?.wuid;
 
     if (!jid) {
-      throw new InternalServerErrorException('Error catalog owner', 'instância sem usuário conectado');
+      throw new InternalServerErrorException('Error catalog owner', 'instance has no connected user');
     }
 
     return jidNormalizedUser(jid);
@@ -5124,22 +5159,40 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async catalogGraphQL<T>(docId: string, variables: unknown, allowRetry = true): Promise<T> {
     const token = await this.fetchCatalogToken();
+    let data: { data?: T; errors?: { code?: number; message?: string }[] };
 
-    const { data } = await axios.post(
-      BaileysStartupService.CATALOG_GRAPHQL_URL,
-      { access_token: token, doc_id: docId, variables, locale: 'pt_BR' },
-      {
-        headers: {
-          Accept: 'application/json',
-          Origin: 'https://web.whatsapp.com',
-          Referer: 'https://web.whatsapp.com/',
+    try {
+      ({ data } = await axios.post(
+        BaileysStartupService.CATALOG_GRAPHQL_URL,
+        { access_token: token, doc_id: docId, variables, locale: 'pt_BR' },
+        {
+          headers: {
+            Accept: 'application/json',
+            Origin: 'https://web.whatsapp.com',
+            Referer: 'https://web.whatsapp.com/',
+          },
         },
-      },
-    );
+      ));
+    } catch (error) {
+      // Meta answers 4xx (code 190 inside an OAuthException) when the ad-account
+      // token died, and the token does rotate. Refresh once, and keep the raw
+      // body in the error - without it the failure is undiagnosable.
+      const status = error?.response?.status;
+
+      if (allowRetry && status >= 400 && status < 500) {
+        this.catalogToken = undefined;
+        return this.catalogGraphQL<T>(docId, variables, false);
+      }
+
+      throw new InternalServerErrorException(
+        'Error catalog mutation',
+        `HTTP ${status ?? '?'}: ${JSON.stringify(error?.response?.data ?? error?.message)}`,
+      );
+    }
 
     if (data?.errors?.length) {
-      // 190 = access token expirado/inválido: renova uma vez antes de falhar.
-      if (allowRetry && data.errors.some((error: { code?: number }) => error?.code === 190)) {
+      // 190 = expired/invalid access token: refresh once before failing.
+      if (allowRetry && data.errors.some((error) => error?.code === 190)) {
         this.catalogToken = undefined;
         return this.catalogGraphQL<T>(docId, variables, false);
       }
@@ -5150,7 +5203,7 @@ export class BaileysStartupService extends ChannelStartupService {
     return data?.data as T;
   }
 
-  // Aceita URL pública ou base64/data-uri; base64 é enviado como mídia de catálogo.
+  // Accepts a public URL or base64/data-uri; base64 is uploaded as catalog media.
   private async catalogImageUrl(image: string): Promise<string> {
     if (isURL(image)) {
       return image;
@@ -5175,7 +5228,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  // Espelha WAWebBizCatalogManagementParseProductGraphql.productModelToGraphQLInput.
+  // Mirrors WAWebBizCatalogManagementParseProductGraphql.productModelToGraphQLInput.
   private async catalogProductInfo(data: createProductDto | updateProductDto): Promise<Record<string, unknown>> {
     const productInfo: Record<string, unknown> = { name: data.name };
 
@@ -5241,7 +5294,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async deleteProduct(data: deleteProductDto): Promise<{ deletedCount: number }> {
-    // Diferente de add/edit, o input do delete é plano: { biz_jid, product_ids }
+    // Unlike add/edit, the delete input is flat: { biz_jid, product_ids }
     // (WAWebBizCatalogDeleteProductsJob -> deleteProduct({ biz_jid, product_ids })).
     const variables = { input: { biz_jid: this.catalogOwnerJid(), product_ids: data.productIds } };
     const result = await this.catalogGraphQL<{ xfb_whatsapp_catalog_delete_product?: { deleted_count?: number } }>(
