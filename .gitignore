@@ -45,4 +45,9 @@ lerna-debug.log*
 *.DS_Store
 .tool-versions
 
+# dev local (catalogo): auth de teste e scripts locais
+/.catalog-test-auth*
+/scripts/
+/qr.png
+
 /prisma/migrations/*

@@ -4,3 +4,8 @@
 FROM evoapicloud/evolution-api:v2.3.7
 
 COPY prebuilt /evolution/dist
+
+# O token de ad-account do catalogo depende do push <wa_ad_account_nonce>.
+# O patch (idempotente) faz o Baileys emitir o evento business.ctwa-nonce.
+COPY tools/patch-baileys-nonce.js /tmp/patch-baileys-nonce.js
+RUN node /tmp/patch-baileys-nonce.js /evolution/node_modules/baileys/lib/Socket/messages-recv.js

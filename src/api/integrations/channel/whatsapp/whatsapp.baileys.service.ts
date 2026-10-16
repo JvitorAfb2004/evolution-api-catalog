@@ -92,6 +92,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  BinaryNode,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -122,7 +123,6 @@ import makeWASocket, {
   ParticipantAction,
   prepareWAMessageMedia,
   Product,
-  ProductUpdate,
   proto,
   UserFacingSocketConfig,
   WABrowserDescription,
@@ -140,11 +140,12 @@ import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
+import { unlink, writeFile } from 'fs/promises';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
-import { release } from 'os';
+import { release, tmpdir } from 'os';
 import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
@@ -697,6 +698,13 @@ export class BaileysStartupService extends ChannelStartupService {
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
+
+    // Evento injetado por tools/patch-baileys-nonce.js: o push <wa_ad_account_nonce>
+    // é o primeiro passo do access_token de ad-account usado nas mutations de catálogo.
+    (this.client.ev as unknown as { on: (event: string, listener: (payload: { nonce: string }) => void) => void }).on(
+      'business.ctwa-nonce',
+      ({ nonce }) => this.resolveCatalogNonce(nonce),
+    );
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -5014,59 +5022,219 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  // Accepts image URLs or base64/data-uri strings and normalizes them to Baileys' WAMediaUpload.
-  private toProductImages(images: string[] = []): WAMediaUpload[] {
-    return images.map((image) => {
-      if (isURL(image)) {
-        return { url: image };
-      }
+  // --- Catálogo (WhatsApp Business) ---
+  // O IQ w:biz:catalog foi desligado pelo WhatsApp; hoje o Web usa GraphQL em
+  // graph.facebook.com com um access_token de ad-account obtido em dois IQs
+  // (smax 118 -> push <wa_ad_account_nonce> -> smax 104).
+  // Refs: https://github.com/vinikjkkj/wa-diff (WAWebBizCatalogManagement*) e
+  // tools/patch-baileys-nonce.js (emite o evento business.ctwa-nonce).
+  private static readonly CATALOG_GRAPHQL_URL = 'https://graph.facebook.com/graphql';
+  private static readonly CATALOG_ADD_DOC = '24249359867999500';
+  private static readonly CATALOG_EDIT_DOC = '9889773371084956';
+  private static readonly CATALOG_DELETE_DOC = '9376108569185474';
+  private static readonly CATALOG_TOKEN_TTL_MS = 20 * 60 * 1000;
+  private static readonly CATALOG_IMAGE_WIDTH = 100;
+  private static readonly CATALOG_IMAGE_HEIGHT = 100;
 
-      const base64 = image.includes(',') ? image.split(',')[1] : image;
-      return Buffer.from(base64, 'base64');
+  private catalogToken?: { value: string; fetchedAt: number };
+  private catalogNonceWaiter?: (nonce: string) => void;
+
+  // Chamado pelo listener de 'business.ctwa-nonce' registrado em createClient.
+  public resolveCatalogNonce(nonce: string): void {
+    this.catalogNonceWaiter?.(nonce);
+  }
+
+  private waitCatalogNonce(timeoutMs = 30000): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.catalogNonceWaiter = undefined;
+        reject(new InternalServerErrorException('Error catalog token', 'timeout aguardando wa_ad_account_nonce'));
+      }, timeoutMs);
+
+      this.catalogNonceWaiter = (nonce: string) => {
+        clearTimeout(timer);
+        this.catalogNonceWaiter = undefined;
+        resolve(nonce);
+      };
     });
   }
 
-  public async createProduct(data: createProductDto): Promise<Product> {
+  private async fetchCatalogToken(force = false): Promise<string> {
+    const cached = this.catalogToken;
+    if (!force && cached && Date.now() - cached.fetchedAt < BaileysStartupService.CATALOG_TOKEN_TTL_MS) {
+      return cached.value;
+    }
+
+    await this.client.query({
+      tag: 'iq',
+      attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'fb:thrift_iq', smax_id: '118' },
+    });
+
+    const nonce = await this.waitCatalogNonce();
+
+    const response = await this.client.query({
+      tag: 'iq',
+      attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'fb:thrift_iq', smax_id: '104' },
+      content: [{ tag: 'parameters', attrs: {}, content: [{ tag: 'code', attrs: {}, content: Buffer.from(nonce) }] }],
+    });
+
+    const content = (response?.content as BinaryNode[]) || [];
+    const tokenNode = content.find((child) => child.tag === 'access_token');
+    const token = tokenNode?.content ? Buffer.from(tokenNode.content as Uint8Array).toString('utf-8') : undefined;
+
+    if (!token) {
+      throw new InternalServerErrorException(
+        'Error catalog token',
+        `access_token ausente no IQ smax 104 (nonce ${nonce})`,
+      );
+    }
+
+    this.catalogToken = { value: token, fetchedAt: Date.now() };
+
+    return token;
+  }
+
+  // O catálogo é endereçado pelo JID dono: LID quando a conta usa LID, senão o PN (sem device).
+  private catalogOwnerJid(): string {
+    const me = this.client?.user;
+    if (!me) {
+      throw new InternalServerErrorException('Error catalog owner', 'instância sem usuário conectado');
+    }
+
+    return jidNormalizedUser(me.lid || me.id);
+  }
+
+  private async catalogMutation<T>(docId: string, variables: unknown, allowRetry = true): Promise<T> {
+    const token = await this.fetchCatalogToken();
+
+    const { data } = await axios.post(
+      BaileysStartupService.CATALOG_GRAPHQL_URL,
+      { access_token: token, doc_id: docId, variables, locale: 'pt_BR' },
+      {
+        headers: {
+          Accept: 'application/json',
+          Origin: 'https://web.whatsapp.com',
+          Referer: 'https://web.whatsapp.com/',
+        },
+      },
+    );
+
+    if (data?.errors?.length) {
+      // 190 = access token expirado/inválido: renova uma vez antes de falhar.
+      if (allowRetry && data.errors.some((error: { code?: number }) => error?.code === 190)) {
+        this.catalogToken = undefined;
+        return this.catalogMutation<T>(docId, variables, false);
+      }
+
+      throw new InternalServerErrorException('Error catalog mutation', JSON.stringify(data.errors));
+    }
+
+    return data?.data as T;
+  }
+
+  // Aceita URL pública ou base64/data-uri; base64 é enviado como mídia de catálogo.
+  private async catalogImageUrl(image: string): Promise<string> {
+    if (isURL(image)) {
+      return image;
+    }
+
+    const base64 = image.includes(',') ? image.split(',')[1] : image;
+    const buffer = Buffer.from(base64, 'base64');
+    const file = join(tmpdir(), `evolution-catalog-${Date.now()}-${v4()}.jpg`);
+    await writeFile(file, buffer);
+
     try {
-      return await this.client.productCreate({
-        name: data.name,
-        retailerId: data.retailerId,
-        url: data.url,
-        description: data.description,
-        price: data.price,
-        currency: data.currency,
-        isHidden: data.isHidden,
-        originCountryCode: data.originCountryCode,
-        images: this.toProductImages(data.images),
+      const fileEncSha256B64 = createHash('sha256').update(buffer).digest('base64');
+      const uploaded = await this.client.waUploadToServer(file, {
+        fileEncSha256B64,
+        mediaType: 'product-catalog-image',
+        timeoutMs: 60000,
       });
-    } catch (error) {
-      throw new InternalServerErrorException('Error createProduct', error.toString());
+
+      return uploaded?.mediaUrl || `https://mmg.whatsapp.net${uploaded?.directPath}`;
+    } finally {
+      await unlink(file).catch(() => undefined);
     }
   }
 
-  public async updateProduct(data: updateProductDto): Promise<Product> {
-    try {
-      return await this.client.productUpdate(data.productId, {
-        name: data.name,
-        retailerId: data.retailerId,
-        url: data.url,
-        description: data.description,
-        price: data.price,
-        currency: data.currency,
-        isHidden: data.isHidden,
-        images: this.toProductImages(data.images),
-      } as ProductUpdate);
-    } catch (error) {
-      throw new InternalServerErrorException('Error updateProduct', error.toString());
+  // Espelha WAWebBizCatalogManagementParseProductGraphql.productModelToGraphQLInput.
+  private async catalogProductInfo(data: createProductDto | updateProductDto): Promise<Record<string, unknown>> {
+    const productInfo: Record<string, unknown> = { name: data.name };
+
+    if (data.images?.length) {
+      const images = await Promise.all(data.images.map(async (image) => ({ url: await this.catalogImageUrl(image) })));
+      productInfo.media = { image: images };
     }
+
+    if (data.description) productInfo.description = data.description;
+    if (data.url) productInfo.url = data.url;
+    if (data.retailerId) productInfo.retailer_id = data.retailerId;
+    if (data.currency) productInfo.currency = data.currency;
+    if (data.price !== undefined) productInfo.price = String(data.price);
+    if (data.isHidden !== undefined) productInfo.is_hidden = data.isHidden;
+
+    return productInfo;
   }
 
-  public async deleteProduct(data: deleteProductDto): Promise<{ deleted: number }> {
-    try {
-      return await this.client.productDelete(data.productIds);
-    } catch (error) {
-      throw new InternalServerErrorException('Error deleteProduct', error.toString());
+  private async catalogProductVariables(
+    data: createProductDto | updateProductDto,
+    productId?: string,
+  ): Promise<Record<string, unknown>> {
+    const product: Record<string, unknown> = {
+      biz_jid: this.catalogOwnerJid(),
+      width: BaileysStartupService.CATALOG_IMAGE_WIDTH,
+      height: BaileysStartupService.CATALOG_IMAGE_HEIGHT,
+      product_info: await this.catalogProductInfo(data),
+    };
+
+    if (productId) {
+      product.product_id = productId;
     }
+
+    return { input: { product } };
+  }
+
+  public async createProduct(data: createProductDto): Promise<Record<string, unknown>> {
+    const variables = await this.catalogProductVariables(data);
+    const result = await this.catalogMutation<{
+      xfb_whatsapp_catalog_add_product?: { product?: Record<string, unknown> };
+    }>(BaileysStartupService.CATALOG_ADD_DOC, variables);
+    const product = result?.xfb_whatsapp_catalog_add_product?.product;
+
+    if (!product) {
+      throw new InternalServerErrorException('Error createProduct', JSON.stringify(result));
+    }
+
+    return product;
+  }
+
+  public async updateProduct(data: updateProductDto): Promise<Record<string, unknown>> {
+    const variables = await this.catalogProductVariables(data, data.productId);
+    const result = await this.catalogMutation<{
+      xfb_whatsapp_catalog_edit_product?: { product?: Record<string, unknown> };
+    }>(BaileysStartupService.CATALOG_EDIT_DOC, variables);
+    const product = result?.xfb_whatsapp_catalog_edit_product?.product;
+
+    if (!product) {
+      throw new InternalServerErrorException('Error updateProduct', JSON.stringify(result));
+    }
+
+    return product;
+  }
+
+  public async deleteProduct(data: deleteProductDto): Promise<{ deletedCount: number }> {
+    const variables = { input: { product: { biz_jid: this.catalogOwnerJid(), product_ids: data.productIds } } };
+    const result = await this.catalogMutation<{ xfb_whatsapp_catalog_delete_product?: { deleted_count?: number } }>(
+      BaileysStartupService.CATALOG_DELETE_DOC,
+      variables,
+    );
+    const deletedCount = result?.xfb_whatsapp_catalog_delete_product?.deleted_count;
+
+    if (deletedCount === undefined || deletedCount === null) {
+      throw new InternalServerErrorException('Error deleteProduct', JSON.stringify(result));
+    }
+
+    return { deletedCount };
   }
 
   public async fetchMessages(query: Query<Message>) {
