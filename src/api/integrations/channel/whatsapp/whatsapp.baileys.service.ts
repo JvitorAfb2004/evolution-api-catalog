@@ -5057,9 +5057,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly CATALOG_DELETE_DOC = '9376108569185474';
   private static readonly CATALOG_FETCH_DOC = '9957894520961099';
   private static readonly CATALOG_COLLECTIONS_DOC = '9687699931342731';
-  // The ad-account token rotates (Meta invalidates it with 190), so keep the
-  // cache short: refreshing is one cheap IQ, a stale token is a failed publish.
-  private static readonly CATALOG_TOKEN_TTL_MS = 5 * 60 * 1000;
+  // The ad-account token is short lived (Meta invalidates it within minutes), so
+  // the cache is almost a formality: any stale-token answer refreshes it anyway.
+  private static readonly CATALOG_TOKEN_TTL_MS = 60 * 1000;
   private static readonly CATALOG_IMAGE_WIDTH = 100;
   private static readonly CATALOG_IMAGE_HEIGHT = 100;
 
@@ -5191,8 +5191,12 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (data?.errors?.length) {
-      // 190 = expired/invalid access token: refresh once before failing.
-      if (allowRetry && data.errors.some((error) => error?.code === 190)) {
+      // The ad-account token rotates: 190 is the plain expired-token answer and
+      // 2498049 is the same failure seen from the catalog side ("Bad Request Error
+      // while getting catalog"). Both are fixed by a fresh token, so refresh once.
+      const staleToken = data.errors.some((error) => error?.code === 190 || error?.code === 2498049);
+
+      if (allowRetry && staleToken) {
         this.catalogToken = undefined;
         return this.catalogGraphQL<T>(docId, variables, false);
       }
