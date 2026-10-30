@@ -52,6 +52,7 @@ import {
   StatusMessage,
   TypeButton,
 } from '@api/dto/sendMessage.dto';
+import { interactiveRelayNodes } from '@api/integrations/channel/whatsapp/whatsapp.interactive-nodes';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -2172,14 +2173,22 @@ export class BaileysStartupService extends ChannelStartupService {
     // NOTE: NÃO DEVEMOS GERAR O messageId AQUI, SOMENTE SE VIER INFORMADO POR PARAMETRO. A GERAÇÃO ANTERIOR IMPEDE O WZAP DE IDENTIFICAR A SOURCE.
     if (messageId) option.messageId = messageId;
 
-    if (message['viewOnceMessage']) {
+    // Buttons go wrapped in viewOnceMessage; lists go as plain listMessage.
+    // Both need the binary nodes injected below, otherwise WhatsApp downgrades them to text.
+    const interactiveContent: proto.IMessage =
+      message['viewOnceMessage']?.message ?? (message['listMessage'] ? message : undefined);
+
+    if (interactiveContent) {
       const m = generateWAMessageFromContent(sender, message, {
         timestamp: new Date(),
         userJid: this.instance.wuid,
         messageId,
         quoted,
       });
-      const id = await this.client.relayMessage(sender, message, { messageId });
+      const id = await this.client.relayMessage(sender, message, {
+        messageId,
+        additionalNodes: interactiveRelayNodes(sender, interactiveContent),
+      });
       m.key = { id: id, remoteJid: sender, participant: isPnUser(sender) ? sender : undefined, fromMe: true };
       for (const [key, value] of Object.entries(m)) {
         if (!value || (isArray(value) && value.length) === 0) {
